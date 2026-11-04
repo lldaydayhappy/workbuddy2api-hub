@@ -108,7 +108,22 @@ services:
 
 更新镜像：`docker compose pull && docker compose up -d`。
 
-### 3. CodeArts 原生第三出口
+### 3. 启动入口：优先用 `-m`
+
+同一份代码、同一个账号池，`python3 wb_proxy.py` 与 `python3 -m wb_proxy` 的常驻内存差 **47-54 MB**
+（Windows 11 / aarch64、Python 3.12-3.14 四套环境实测一致，见 #702）。成因仍在排查，
+但只要换成 `-m` 就能拿到这段收益——512 MB 的设备上约 10%。
+
+```bash
+cd /path/to/workbuddy2api-hub        # 必须先进入 wb_proxy.py 所在目录
+python3 -m wb_proxy --port 8788
+```
+
+`-m` 把**当前目录**放进 `sys.path`，而脚本方式放的是脚本所在目录，所以务必先 `cd`。
+仓库内的资源路径都基于 `__file__` 解析，不受影响。Docker 镜像和 OpenWrt 包已改用 `-m`；
+Windows / macOS 的 `start-wb-proxy.*` 启动脚本暂未改动。
+
+### 4. CodeArts 原生第三出口
 
 网关内置进程内直连华为云 CodeArts，支持聊天 SSE 协议转换与自动签到，无需单独运行第三方桥接服务：
 1. 打开看板 →「设置 → CodeArts 接入」，勾选「启用 CodeArts 出口」并保存；
@@ -164,7 +179,6 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 | `API_KEY` | 自动生成 | 初始 API Key（看板配置多 Key 后优先由看板管理） |
 | `WB_DEPLOY_MODE` | `lan` | 部署模式：`lan`（0.0.0.0）、`local`（127.0.0.1）、`public` |
 | `WB_MAX_PAYLOAD_BYTES` | `16777216` | 单请求体上限（字节，默认 16MB，支持 1–256 MB） |
-| `WB_DEEPSEEK_FLASH_FORCE_SG` | `0` | 国际版 deepseek-v4.1-flash 是否强制出站走新加坡付费通道 |
 | `WB_ENABLE_ANTHROPIC_MESSAGES` | `0` | 是否开启实验性 Anthropic Messages 协议转换 |
 | `WB_BACKGROUND_MODEL_TARGET` | 留空 | 后台模型别名改写目标（如 DSH 客户端自动映射） |
 | `WB_CA_BUNDLE` | 留空 | 自签根证书路径（供抓包调试或中间代理使用） |
@@ -200,7 +214,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 262 个套件：198 个 Python + 64 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 265 个套件：200 个 Python + 65 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 
@@ -210,7 +224,17 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 
 ### Unreleased
 
-- 暂无。
+- 移除已废弃的 `WB_DEEPSEEK_FLASH_FORCE_SG` 文档行与两个恒返回 `False` 的存根函数（#776）。
+- **CodeArts 模型倍率**：`/v1/models?realm=codearts` 的条目新增 `credits`（如 `x0.7`，与 WorkBuddy 目录同一写法），取自上游模型目录的标准档；错峰优惠档不计入，上游没有倍率的模型不带此字段。
+- **改善 Claude Code 兼容性**（#733）：`sanitize` 现在把
+  `You are Claude Code, Anthropic's official CLI tool for Claude.` 整句中性化；
+  旧规则只把 `CLI for Claude` 改写成 `CLI tool for Claude`，反而保留了
+  `You are Claude Code` 指纹。覆盖大小写与弯引号，`user` / `tool` 内容不改写。
+- 启动检查不再把"端口能连上但一直不答"当成端口空闲。此前 `--probe-only` 用 2 秒超时探 `/health`，卡死的实例只会让它超时，于是判定端口可用、又叠了一层实例；Windows 的 `SO_REUSEADDR` 允许重复监听，内核仍把新连接分给卡死的那个，看板与日志查看器就一直是空的。现在这种情况明确报错（退出码 1）并给出占端口 PID 的查法，不再静默重复启动。
+- 部署入口改用 `python3 -m wb_proxy`（OpenWrt init 与 Dockerfile）：同一份代码实测空闲内存少 47-54 MB（#702 / #777）。
+- 新增 `WB_DUMP_11_128` 本地取证开关（默认关闭）：`1` 只写脱敏摘要，`full` 额外写出站
+  body，文件落在 `usage/11-128-dumps/`；用于定位 Claude Code 专属 11-128 的真实请求差异
+  （#733）。摘要不含提示词明文，`full` 含明文但由使用者显式开启。
 
 完整历史版本与详细变更日志请查阅 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
 
