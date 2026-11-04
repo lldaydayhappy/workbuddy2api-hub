@@ -10797,6 +10797,23 @@ def _usage_cache_series_entry(realm, state):
             "hits_overflow": bool(state["hits_overflow"])}
 
 
+class _lock_if_free(object):
+    """Hold `lock` if it is free right now; `as` gives whether it was taken."""
+
+    def __init__(self, lock):
+        self.lock = lock
+        self.held = False
+
+    def __enter__(self):
+        self.held = self.lock.acquire(blocking=False)
+        return self.held
+
+    def __exit__(self, *exc):
+        if self.held:
+            self.lock.release()
+        return False
+
+
 def _usage_cache_collect_kind(kind):
     """逐把取一类状态，做锁外可序列化的深拷贝；返回 (entries, offset) 或 None。
 
@@ -10807,11 +10824,18 @@ def _usage_cache_collect_kind(kind):
 
     entries 为空（状态都归零/不可复现）时返回 None：没得写就不写，等下一次
     折叠成功再落盘。offset 是该类各 realm 状态里的最远位置。
+
+    状态锁只做非阻塞尝试：拿不到（别的线程正在这把锁里全量重折）同样返回
+    None，这一类留到下次再写。全量重折会在锁里扫完整个日志（GB 级日志要几十
+    分钟），而调用方持着 _usage_cache_write_lock、往往还持着自己视图的缓存锁
+    （如 _byacct_lock）——阻塞等待会把别的视图一起拖死（面板 by-account 524）。
     """
     if kind == "snapshot":
         entries = []
         done = 0
-        with _usage_snap_state_lock:
+        with _lock_if_free(_usage_snap_state_lock) as held:
+            if not held:
+                return None
             for realm, state in _usage_snap_state.items():
                 entry = _usage_cache_snapshot_entry(realm, state)
                 if entry is not None:
@@ -10819,7 +10843,9 @@ def _usage_cache_collect_kind(kind):
                     done = max(done, state["offset"])
         return (entries, done) if entries else None
     if kind == "by_account":
-        with _byacct_state_lock:
+        with _lock_if_free(_byacct_state_lock) as held:
+            if not held:
+                return None
             entry = _usage_cache_by_account_entry(_byacct_state)
             if entry is None:
                 return None
@@ -10827,7 +10853,9 @@ def _usage_cache_collect_kind(kind):
     if kind == "analytics":
         entries = []
         done = 0
-        with _analytics_state_lock:
+        with _lock_if_free(_analytics_state_lock) as held:
+            if not held:
+                return None
             for realm, state in _analytics_state.items():
                 entry = _usage_cache_analytics_entry(realm, state)
                 if entry is not None:
@@ -10837,7 +10865,9 @@ def _usage_cache_collect_kind(kind):
     if kind == "series":
         entries = []
         done = 0
-        with _series_state_lock:
+        with _lock_if_free(_series_state_lock) as held:
+            if not held:
+                return None
             for realm, state in _series_state.items():
                 entry = _usage_cache_series_entry(realm, state)
                 if entry is not None:
@@ -10845,7 +10875,9 @@ def _usage_cache_collect_kind(kind):
                     done = max(done, state["offset"])
         return (entries, done) if entries else None
     if kind == "remaining":
-        with _remaining_state_lock:
+        with _lock_if_free(_remaining_state_lock) as held:
+            if not held:
+                return None
             entry = _usage_cache_remaining_entry(_remaining_state)
             if entry is None:
                 return None
@@ -11035,6 +11067,7 @@ def runtime_settings_view():
         "identity": wb_settings.identity_config(ACCOUNTS_DIR),
         "identity_version_defaults": wb_identity.default_versions(),
         "codearts": wb_codearts.masked_config(ACCOUNTS_DIR),
+        "daily_activity": wb_settings.daily_activity_enabled(ACCOUNTS_DIR),
         "daily_chat_web": wb_settings.daily_chat_web(ACCOUNTS_DIR),
         "daily_chat_web_timeout":
             wb_settings.daily_chat_web_timeout(ACCOUNTS_DIR,
@@ -11070,6 +11103,10 @@ def runtime_settings_view():
             wb_settings.remaining_priority_enabled(ACCOUNTS_DIR),
         "egress_backoff_enabled":
             wb_settings.egress_backoff_enabled(ACCOUNTS_DIR),
+        "restriction_hold_seconds":
+            int(wb_settings.restriction_hold_seconds(ACCOUNTS_DIR)),
+        "restriction_holds":
+            all_restriction_holds(),
         "realm_fallback_enabled":
             wb_settings.realm_fallback_enabled(ACCOUNTS_DIR),
         "account_max_concurrent":
@@ -11110,7 +11147,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.10.9",
+        "version": "1.10.10",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -15599,46 +15636,73 @@ _RESTRICTION_EVENTS = {}   # realm -> {uid: epoch}（窗口内被限制的账号
 _RESTRICTION_HOLD = {}     # realm -> 暂停到哪个 epoch
 
 
-def reset_restriction_state():
-    """清空连坐保护状态（测试，以及人工确认「已申诉、可以恢复派发」时用）。"""
+def reset_restriction_state(realm=None):
+    """重置风控连坐状态。若指定 realm 则清空该区域，否则全部清空。"""
     with _RESTRICTION_LOCK:
-        _RESTRICTION_EVENTS.clear()
-        _RESTRICTION_HOLD.clear()
+        if realm:
+            _RESTRICTION_EVENTS.pop(realm, None)
+            _RESTRICTION_HOLD.pop(realm, None)
+        else:
+            _RESTRICTION_EVENTS.clear()
+            _RESTRICTION_HOLD.clear()
 
 
 def restriction_hold_remaining(realm, now=None):
-    """该区域整池暂停还剩多少秒（0 = 没有暂停）。"""
+    """查询指定区域连坐暂停的剩余秒数（0 = 没有暂停）。"""
     now = time.time() if now is None else now
     with _RESTRICTION_LOCK:
         return max(0.0, _RESTRICTION_HOLD.get(realm, 0.0) - now)
 
 
-def note_account_restriction(realm, uid="", now=None):
-    """记一次账号级风控限制；返回整池暂停的到期 epoch（0 = 尚未触发）。
+def all_restriction_holds(now=None):
+    """返回所有处于连坐暂停中的 realm 及剩余秒数（整数）。"""
+    now = time.time() if now is None else now
+    with _RESTRICTION_LOCK:
+        return {
+            realm: max(0, int(until - now))
+            for realm, until in _RESTRICTION_HOLD.items()
+            if until > now
+        }
 
-    同一窗口内达到 RESTRICTION_WAVE_MIN 个**不同**账号被限制，就认为上游在
-    按设备 / 出口做连坐清扫：把整个区域暂停 RESTRICTION_HOLD_SECONDS，期间
-    不再向上游发任何请求（open_upstream 直接快速失败），等人工确认或时间到
-    再恢复。按 uid 去重，所以同一个号被反复探测 / 测试不会把暂停骗出来。
+
+def clamp_restriction_holds(max_seconds, now=None):
+    """当用户调整了暂停时长，实时截断当前现存的暂停倒计时。"""
+    now = time.time() if now is None else now
+    with _RESTRICTION_LOCK:
+        if max_seconds <= 0:
+            _RESTRICTION_HOLD.clear()
+            return
+        for realm, until in list(_RESTRICTION_HOLD.items()):
+            if until > now + max_seconds:
+                _RESTRICTION_HOLD[realm] = now + max_seconds
+
+
+def note_account_restriction(realm, uid="", now=None):
+    """记一次账号级风控限制；若触发连坐暂停则返回暂停到的 epoch（0 = 尚未触发）。
+
+    同一个区域内达到 RESTRICTION_WAVE_MIN 个**不同**账号被限制，判定为该区域
+    遭到了设备 / 出口级别的风控连坐扫荡，全区域紧急暂停配置的 hold_seconds 秒；期间
+    所有发往该区域的任何请求（open_upstream）直接快速失败，直到人工确认或时间到
+    才恢复。按 uid 去重，避免同一个账号被重复探测 / 重试反复把暂停骗长。
     """
     now = time.time() if now is None else now
     uid = str(uid or "").strip() or "-"
+    hold_sec = wb_settings.restriction_hold_seconds(ACCOUNTS_DIR)
     with _RESTRICTION_LOCK:
         events = {key: at for key, at in _RESTRICTION_EVENTS.get(realm, {}).items()
                   if now - at <= RESTRICTION_WAVE_WINDOW}
         events[uid] = now
         _RESTRICTION_EVENTS[realm] = events
-        if len(events) < RESTRICTION_WAVE_MIN or RESTRICTION_HOLD_SECONDS <= 0:
+        if len(events) < RESTRICTION_WAVE_MIN or hold_sec <= 0:
             return 0.0
         until = max(_RESTRICTION_HOLD.get(realm, 0.0),
-                    now + RESTRICTION_HOLD_SECONDS)
+                    now + hold_sec)
         _RESTRICTION_HOLD[realm] = until
     log("upstream restriction wave on %s: %d account(s) restricted within %.0fs; "
         "pausing dispatch for %.0fs to avoid cross-account bans (uid %s)"
         % (realm, len(events), RESTRICTION_WAVE_WINDOW,
-           RESTRICTION_HOLD_SECONDS, uid[:8]))
+           hold_sec, uid[:8]))
     return until
-
 
 def restriction_hold_message(realm, remaining):
     """整池暂停期间交给客户端的说明。"""
@@ -19765,7 +19829,8 @@ def _release_key_slot(key_entry):
 # /shutdown 修好之后，/updates/check、/updates/install、/quota-scan/run 又漏了。
 # 新增这类「不读 body」的面板路由，请加进这个元组，别在路由里另写一份。
 BODYLESS_PANEL_POSTS = ("/console/toggle", "/shutdown", "/updates/check",
-                        "/updates/install", "/quota-scan/run")
+                        "/updates/install", "/quota-scan/run",
+                        "/settings/restriction/reset")
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -19854,7 +19919,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.10.9"
+    server_version = "wb-proxy/1.10.10"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -22430,6 +22495,15 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 return self._error(400, str(exc), "invalid_request_error")
             reply["auto_switch_products"] = clean
+        if "daily_activity" in payload:
+            # Strictly a JSON boolean, like the other switches: a string "false"
+            # must not be read as "on" (or the other way round).
+            raw = payload.get("daily_activity")
+            if not isinstance(raw, bool):
+                return self._error(400, "daily_activity must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_daily_activity_enabled(ACCOUNTS_DIR, raw)
+            reply["daily_activity"] = raw
         if "daily_chat_web" in payload:
             raw = payload.get("daily_chat_web")
             if not isinstance(raw, bool):
@@ -22567,6 +22641,18 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
             wb_settings.set_realm_fallback_enabled(ACCOUNTS_DIR, raw)
             reply["realm_fallback_enabled"] = raw
+        if "restriction_hold_seconds" in payload:
+            raw = payload.get("restriction_hold_seconds")
+            try:
+                val = float(raw)
+                if val < 0:
+                    raise ValueError("negative")
+                saved = wb_settings.set_restriction_hold_seconds(ACCOUNTS_DIR, val)
+                clamp_restriction_holds(saved)
+                reply["restriction_hold_seconds"] = saved
+            except (ValueError, TypeError):
+                return self._error(400, "restriction_hold_seconds must be a non-negative number",
+                                   "invalid_request_error")
         if "account_max_concurrent" in payload:
             # 账号级并发上限：0 = 不限（默认，与上游一字不差）；1..10 = 每账号
             # 同时最多几个 chat 请求。严格整数，字符串 "1" 不算数（它会被当成
@@ -23515,9 +23601,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _route_accounts_credits_fetch(self, payload):
         uid = payload.get("uid")
+        uids = payload.get("uids")
         realm = payload.get("realm")
+        if "uids" in payload and not isinstance(uids, list):
+            # 写坏了的 uids（字符串 / 对象 / null）不能落到下面的全池扫。
+            return self._error(400, "uids must be a list", "invalid_request_error")
         if uid:
             targets = [POOL.get(uid)]
+        elif isinstance(uids, list):
+            # 面板自动补快照：只补点名的这几个号（缺积分的），空列表就是什么都不刷，
+            # 绝不退化成全池扫。多于一个号时照样吃下面的单飞与拟人间隔。
+            targets = [POOL.get(u) for u in dict.fromkeys(str(x) for x in uids if x)]
         elif realm and realm != "all":
             targets = [a for a in POOL.accounts if a.realm == realm]
         else:
@@ -23952,15 +24046,37 @@ class Handler(BaseHTTPRequestHandler):
     def _route_accounts_login_start(self, payload):
         platform = payload.get("platform") or "CLI"
         target_realm = payload.get("realm") or CURRENT_REALM
+        slot_id = payload.get("proxySlot")
+        if slot_id is not None and not isinstance(slot_id, str):
+            return self._error(400, "proxySlot must be a string", "invalid_request_error")
+        taken = set()
+        if slot_id == wb_accounts.LOGIN_SLOT_AUTO:
+            # "auto" must not hand out a slot a CodeArts account already uses.
+            try:
+                taken = {a.proxy_slot for a in wb_codearts.pool_for(ACCOUNTS_DIR).accounts
+                         if a.proxy_slot}
+            except Exception as exc:
+                log("login auto proxy slot: CodeArts bindings unavailable (%s)" % exc)
         try:
-            started = POOL.start_login(realm=target_realm, platform=platform)
+            started = POOL.start_login(realm=target_realm, platform=platform,
+                                       proxy_slot=slot_id, taken_slots=taken)
+        except wb_accounts.LoginProxySlotError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
         except wb_accounts.TLSVerifyError as exc:
             # The hint already names the file/variable to fix; prefixing it
             # with "could not start login" only buries it.
             return self._error(502, str(exc))
         except Exception as exc:
             return self._error(502, "could not start login: %s" % exc)
-        log("oauth login started (realm=%s, platform=%s, state=%s)" % (target_realm, platform, started["state"][:8]))
+        # A proxy URL may carry user:pass; the log and the panel only ever get
+        # its host:port (egress_exit), never the URL itself.
+        exit_label = egress_exit(started.get("proxy")) if started.get("proxy") else ""
+        started = dict(started, proxy=exit_label)
+        via = "direct"
+        if exit_label:
+            via = ("%s %s" % (started.get("proxySlot") or "", exit_label)).strip()
+        log("oauth login started (realm=%s, platform=%s, state=%s, proxy=%s)"
+            % (target_realm, platform, started["state"][:8], via))
         return self._json(200, started)
 
     def _route_accounts_login_cancel(self, payload):
@@ -24926,6 +25042,15 @@ class Handler(BaseHTTPRequestHandler):
             if not self._panel_ok():
                 return self._error(401, "panel password required", "invalid_request_error")
             return self._handle_settings_save()
+        if path == "/settings/restriction/reset":
+            if not self._panel_ok():
+                return self._error(401, "panel password required", "invalid_request_error")
+            reset_restriction_state()
+            return self._json(200, {
+                "ok": True,
+                "message": "风控连坐暂停已立即解除 / Restriction hold cleared",
+                "restriction_holds": {},
+            })
         if path == "/updates/check":
             # Panel-only management write, like the pricing ones. No body to
             # read: the action takes no parameters, so a button that posts
