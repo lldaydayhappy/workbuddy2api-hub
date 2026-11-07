@@ -976,6 +976,14 @@ def read_catalog_dump(realm):
         return None
 MODELS_PATH = "/v2/enterprises/personal/models"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+# Routes whose request head is traced on arrival (see do_POST): the ones a
+# conversation actually uses, so the trace stays quiet on panel polling.
+_CHAT_PATHS = (
+    "/v1/chat/completions", "/chat/completions",
+    "/v1/completions", "/completions",
+    "/v1/responses", "/responses",
+    "/v1/messages", "/messages",
+)
 
 # ---------------------------------------------------------------------------
 # Background-model redirection (desktop clients).
@@ -1003,7 +1011,57 @@ BACKGROUND_MODEL_NAMES = tuple(
 )
 
 
+INTL_MODEL_ALIASES = {
+    "deepseek-v4.1-flash": "deepseek-v4.1-flash-sg",
+}
+
+
+def intl_model_alias_enabled():
+    """The intl id remap is on unless WB_INTL_MODEL_ALIAS disables it."""
+    raw = os.environ.get("WB_INTL_MODEL_ALIAS", "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def intl_model_alias(name, realm=None):
+    """The intl upstream id for `name`, or `name` unchanged.
+
+    The intl exit renamed deepseek-v4.1-flash to the "-sg" build in 2026-11:
+    the desktop client's own catalogue (and the product config fetched from
+    www.workbuddy.ai) lists only deepseek-v4.1-flash-sg, while a request for
+    the old base id answers code 6004 "usage exceeds frequency limit" on
+    accounts whose base bucket is empty.
+
+    This is an outbound alias only. Clients and /v1/models keep the logical
+    id, and API-key model checks run before the alias is applied.
+    """
+    text = str(name or "")
+    if (realm or CURRENT_REALM) != "intl" or not intl_model_alias_enabled():
+        return text
+    return INTL_MODEL_ALIASES.get(text.strip().lower(), text)
+
+
+def apply_intl_model_alias(payload, realm=None):
+    """Rewrite one request body to the intl upstream id; returns the new id.
+
+    Kept for callers that are constructing an outbound body themselves (the
+    panel probe and the window probe). The request handlers must not call it:
+    rewriting the client payload at ingress would make /v1/models and API-key
+    permissions see the upstream id instead of the logical one.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    name = str(payload.get("model") or "")
+    target = intl_model_alias(name, realm)
+    if target == name:
+        return name
+    payload["model"] = target
+    log("alias: intl model %s -> %s" % (name, target))
+    return target
+
+
 def _apply_deepseek_flash_target(payload, realm=None):
+    # Historical hook kept as a no-op: the intl alias is applied when the
+    # upstream body is built, after all client-facing model checks.
     return
 
 
@@ -11675,7 +11733,7 @@ _LOG_WARN_HINTS = (
 # 想按模块看某一类问题时筛不出来。原有类别（chat/scheduler/tasks/accounts/
 # catalog/auth/settings）的相对顺序保持不变，避免改变既有日志的归类。
 _LOG_TAG_HINTS = (
-    ("chat", ("chat:", "chat done", "request error", "/v1/chat",
+    ("chat", ("chat:", "chat head:", "chat done", "request error", "/v1/chat",
               "/chat/completions", "responses")),
     ("scheduler", ("scheduler", "调度器")),
     ("tasks", ("task", "任务", "打卡", "签到", "猫猫", "travel", "growth")),
@@ -16288,7 +16346,8 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         POOL.apply_remaining_weights(
             remaining_schedule_weights() if remaining_priority_enabled() else None)
     realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
-    model = str(payload.get("model") or "")
+    requested_model = str(payload.get("model") or "")
+    model = intl_model_alias(requested_model, realm)
     pinned = pin_account if pin_account is not None else pinned_account()
     if pinned is not None:
         if allowed_accounts is not None and pinned.uid not in allowed_accounts:
@@ -16317,6 +16376,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # payload 重建（degrade 会切换 prompt 模式，必须拿到新 body）。
     upstream_body = (prebuilt_body if prebuilt_body is not None
                      else build_upstream_body(payload))
+    if upstream_body.get("model") != model:
+        # prebuilt_body is built from the client payload before open_upstream
+        # is called. Copy before changing it so callers can safely reuse their
+        # object across retries, and so the client-visible model never changes.
+        upstream_body = dict(upstream_body)
+        upstream_body["model"] = model
     # PATCHED-BY-OPS: 客户端未提供会话标识时，用对话稳定前缀兜底。
     # 位置放在 build_upstream_body 之后，保证键与真正发往上游的消息一致
     # （该函数可能在最前面插入 SYSTEM_PROMPT）。affinity_page 只在超限对话上
@@ -16577,6 +16642,11 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 resp._wb_account_uid = account.uid
             except Exception:
                 pass
+            if model != requested_model:
+                try:
+                    resp._wb_billed_model = model
+                except Exception:
+                    pass
             slot_held = None
             # The third element is the reasoning effort this request ran at: the
             # body is rebuilt per attempt, but the effort is a property of the
@@ -16776,6 +16846,14 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 # catalogue label; the tier map from `/v3/config` now drives
                 # both the scheduler and that label, so the request never gets
                 # this far for a gated model.
+                #
+                # `raise` skips the slot release after the loop, so hand the
+                # concurrency seat back first: without this the account stays
+                # "serving 1 request" forever and every later pick skips it
+                # (`account_max_concurrent=1` makes one leaked seat fatal).
+                if slot_held is not None:
+                    account_slot_release(slot_held)
+                    slot_held = None
                 raise
             if exc.code >= 500:
                 detail = http_error_detail(exc)
@@ -16816,6 +16894,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     POOL.affinity.demote(session_key, account.uid)
                 last_error = exc
                 continue
+            # Same leak as the 400 branch above: an unhandled status (e.g. 404
+            # from a wrong chat path) escapes the loop, so release the seat
+            # before unwinding.
+            if slot_held is not None:
+                account_slot_release(slot_held)
+                slot_held = None
             raise
         except Exception as exc:
             if wb_accounts.is_tls_verify_error(exc):
@@ -16880,6 +16964,10 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # Only spend credits after every enabled, credential-bearing account in
     # this realm has a persisted upstream 6004 cap for this free model. The
     # switch is opt-in because the retry can incur real charges.
+    # When the intl alias is enabled, `model` is already the paid -sg route;
+    # looking up the logical base id here would trigger the legacy free-to-paid
+    # fallback a second time. Keep the old lookup keyed by the effective model
+    # so it still works when WB_INTL_MODEL_ALIAS=0.
     paid_model = _FREE_MODEL_CREDIT_FALLBACKS.get((realm, model))
     eligible = ([a for a in POOL.accounts
                  if a.realm == realm and a.enabled and a.access_token
@@ -17256,12 +17344,13 @@ def probe_account(account, model=None, timeout=30):
     单个「测试」与「一键测试」共用这一份：两边各写一套的话，早晚一边忘了清计数、
     另一边忘了认本机断网——而这两件事正是「明明测了能用，它还熔断」的全部来源。
     """
-    model = model or TEST_MODEL_DEFAULT
+    logical_model = model or TEST_MODEL_DEFAULT
+    upstream_model = intl_model_alias(logical_model, account.realm)
     row = {"uid": account.uid, "nickname": account.nickname or account.uid[:8],
-           "realm": account.realm, "model": model, "ok": False, "elapsed_ms": 0,
+           "realm": account.realm, "model": logical_model, "ok": False, "elapsed_ms": 0,
            "status": None, "reply": "", "error": "", "network": False}
     chat_url = account.chat_base_url() + CHAT_PATH
-    test_body = {"model": model, "messages": [{"role": "user", "content": "hi"}],
+    test_body = {"model": upstream_model, "messages": [{"role": "user", "content": "hi"}],
                  "stream": False}
     probe_body = build_upstream_body(test_body)
     cli_identity = account.is_cli_identity()
@@ -17275,7 +17364,7 @@ def probe_account(account, model=None, timeout=30):
         body = wb_identity.gzip_body(body)
     # 与 open_upstream 同一条出站形态：VSCode 身分的 model 请求带 X-Model-ID；
     # CLI / VSCode 官方主 chat 都默认 gzip。
-    probe_headers = account.headers(purpose="chat", model=model)
+    probe_headers = account.headers(purpose="chat", model=upstream_model)
     if cli_identity or vscode_identity:
         probe_headers["Content-Encoding"] = wb_identity.REQUEST_CONTENT_ENCODING
     req = urllib.request.Request(chat_url, data=body, method="POST",
@@ -17284,7 +17373,7 @@ def probe_account(account, model=None, timeout=30):
     t0 = time.time()
     try:
         with wb_accounts.urlopen(req, timeout=timeout, proxy=account.proxy) as resp:
-            chat_obj = aggregate_stream(resp, model, None)
+            chat_obj = aggregate_stream(resp, upstream_model, None)
             row["elapsed_ms"] = int((time.time() - t0) * 1000)
             choices = chat_obj.get("choices") or []
             msg = (choices[0].get("message") or {}) if choices else {}
@@ -17296,7 +17385,7 @@ def probe_account(account, model=None, timeout=30):
             # ladder from it. Only the tested model's cooldown is dropped here -
             # sibling models keep theirs, and a 402 balance park keeps its own lift
             # path (revive_balance_cooldown on a credits refresh).
-            account.note_success(model=model)
+            account.note_success(model=upstream_model)
             row["ok"] = True
             return row
     except urllib.error.HTTPError as exc:
@@ -17499,7 +17588,12 @@ class SSEHeartbeat:
 
 
 def aggregate_stream(raw_iter, model, resp_id):
-    """Fold an SSE stream into one non-streaming chat.completion object."""
+    """Fold an SSE stream into one non-streaming chat.completion object.
+
+    `model` is the client-facing id. Upstream chunks may echo an outbound alias
+    (for example the intl -sg route); that must not replace the logical model.
+    """
+    logical_model = model
     content, reasoning, finish = [], [], "stop"
     tool_calls_map = {}
     usage = None
@@ -17523,8 +17617,6 @@ def aggregate_stream(raw_iter, model, resp_id):
             first_chunk_at = time.time()
         if chunk.get("id"):
             resp_id = chunk["id"]
-        if chunk.get("model"):
-            model = chunk["model"]
         u = chunk.get("usage")
         if u:
             if usage is None or (u.get("total_tokens") or 0) >= (usage.get("total_tokens") or 0):
@@ -17639,7 +17731,7 @@ def aggregate_stream(raw_iter, model, resp_id):
         "id": resp_id or f"chatcmpl-wb-{uuid.uuid4().hex[:16]}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": model,
+        "model": logical_model,
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
     }
     if usage:
@@ -19183,7 +19275,9 @@ def stream_messages_events(raw_iter, model, holder=None):
         state["started"] = True
         if isinstance(chunk, dict):
             state["id"] = _anthropic_text(chunk.get("id"))
-            state["model"] = _anthropic_text(chunk.get("model")) or state["model"]
+            # `model` is the client-facing id. Do not let the outbound intl
+            # alias (-sg) leak into the Anthropic response.
+            state["model"] = model
         return anthropic_sse_frame("message_start", {
             "message": {
                 "id": _anthropic_message_id(state["id"]),
@@ -19481,6 +19575,7 @@ def reasoning_only_response(result):
 
 def stream_responses_events(upstream, model, holder):
     """Yield Responses-API SSE frames translated from chat-completions chunks."""
+    logical_model = model
     resp_id, msg_id, rs_id = _new_id("resp_"), _new_id("msg_"), _new_id("rs_")
     created = int(time.time())
     seq = 0
@@ -19510,7 +19605,7 @@ def stream_responses_events(upstream, model, holder):
             "object": "response",
             "created_at": created,
             "status": status,
-            "model": model,
+            "model": logical_model,
             "output": [o for o in outputs if o],
             "output_text": "".join(text_parts),
             "parallel_tool_calls": meta.get("parallel_tool_calls", True),
@@ -24894,10 +24989,15 @@ class Handler(BaseHTTPRequestHandler):
         want_stream = bool(payload.get("stream"))
         t_start = time.time()
         fp = prompt_fingerprint(chat_req.get("messages"))
+        # Log the level the request will actually run at, not just what the
+        # client typed: when the client omits `reasoning_effort` the gateway
+        # fills in the model's default (deepseek-* get one), so a bare
+        # `effort=None` reads as "no reasoning" even though it ran at `high`.
         log(
-            "responses: model=%s stream=%s msgs=%d effort=%r tools=%d/%d custom_tools=%s compaction=%s key=%s"
+            "responses: model=%s stream=%s msgs=%d effort=%r -> upstream_effort=%r tools=%d/%d custom_tools=%s compaction=%s key=%s"
             % (model, want_stream, len(chat_req.get("messages") or []),
-               chat_req.get("reasoning_effort"),
+               client_effort_of(chat_req),
+               upstream_effort_of(chat_req, model),
                len(chat_req.get("tools") or []), len(all_tools),
                sorted(custom_names) or "-", compaction, key_label(self._key_id()) or "-")
         )
@@ -25425,6 +25525,17 @@ class Handler(BaseHTTPRequestHandler):
         if not self._apply_pinned_route():
             return
         path = self.path.split("?")[0]
+        # Arrival trace for the model routes only, before any body work: the
+        # chat log line is written after the body is in hand, so a request whose
+        # upload is slow (or that a CDN in front of us is still buffering) left
+        # no trace at all - a conversation could look "stuck for minutes" while
+        # the gateway had no line to show for it. This marks the moment the
+        # request head reached this process; pair it with body_wait to tell
+        # "arrived but still uploading" from "never arrived".
+        if path in _CHAT_PATHS:
+            log("chat head: %s content_length=%s key=%s"
+                % (path, self.headers.get("Content-Length") or "-",
+                   key_label(self._key_id()) or "-"), tag="chat")
         if path in BODYLESS_PANEL_POSTS:
             # 这一组路由不解析 body，但面板按钮确实会发一个 `{}`：不在这里排空，
             # 残留字节就会成为同一条连接上下一个请求的请求行（见 BODYLESS_PANEL_POSTS
@@ -25611,7 +25722,6 @@ class Handler(BaseHTTPRequestHandler):
         _apply_background_model_alias(payload)
         if is_media_route:
             return self._handle_media_post(path, payload)
-        _apply_deepseek_flash_target(payload, self._request_realm() or CURRENT_REALM)
         # Check per-key concurrency limit (#359)
         key_ok, cur_key_conc, max_key_conc = _acquire_key_slot(self.key_entry)
         if not key_ok:
@@ -26013,6 +26123,11 @@ class Handler(BaseHTTPRequestHandler):
                         # though both halves arrived. Normalise before emitting.
                         if isinstance(maybe, dict) and maybe.get("id"):
                             maybe["id"] = stream_chunk_id
+                        # The upstream may echo its outbound alias (-sg). The
+                        # client asked for the logical id, and model-scoped
+                        # chunk helpers below must use that same id too.
+                        if isinstance(maybe, dict) and maybe.get("model"):
+                            maybe["model"] = model
                         cleaned = clean_chunk(
                             json.dumps(maybe, ensure_ascii=False)
                             if isinstance(maybe, dict) else data)
