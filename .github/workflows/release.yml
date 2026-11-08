@@ -472,23 +472,34 @@ jobs:
           set -eu
           mkdir -p .sdk-cache
           OUT=".sdk-cache/${SDK_TARBALL}"
-          # The official host is sometimes unusably slow on runners, so try
-          # mirrors and treat "slower than 200KB/s for 60s" as a stall.
+          # 270 MB is large enough that a single slow CDN connection can sit
+          # below the job timeout for half an hour. aria2 uses several
+          # connections per mirror. Do not apply a per-connection speed floor:
+          # CDN shards legitimately slow down independently while the aggregate
+          # transfer remains healthy, and aria2 treats those shards as fatal.
+          if ! command -v aria2c >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y aria2
+          fi
           ok=0
           for base in \
+            "https://mirrors.ustc.edu.cn/openwrt/releases/${SDK_REL}/targets/x86/64" \
             "https://downloads.openwrt.org/releases/${SDK_REL}/targets/x86/64" \
-            "https://mirror2.openwrt.org/releases/${SDK_REL}/targets/x86/64" \
-            "https://mirrors.tuna.tsinghua.edu.cn/openwrt/releases/${SDK_REL}/targets/x86/64" \
-            "https://mirrors.ustc.edu.cn/openwrt/releases/${SDK_REL}/targets/x86/64"
+            "https://mirror2.openwrt.org/releases/${SDK_REL}/targets/x86/64"
           do
             echo "== mirror: ${base}"
-            if curl -fL --retry 2 --retry-all-errors --connect-timeout 20 \
-                 --max-time 1200 --speed-time 60 --speed-limit 204800 \
-                 -o "$OUT" "${base}/${SDK_TARBALL}"; then
+            rm -f "$OUT" "$OUT.aria2"
+            if aria2c --allow-overwrite=true --auto-file-renaming=false \
+                 --max-tries=5 --retry-wait=5 --connect-timeout=20 \
+                 --timeout=120 \
+                 --max-connection-per-server=16 --split=16 --min-split-size=1M \
+                 --file-allocation=none --console-log-level=warn \
+                 --summary-interval=0 --dir=".sdk-cache" \
+                 --out="${SDK_TARBALL}" "${base}/${SDK_TARBALL}"; then
               ok=1; break
             fi
             echo "::warning::mirror failed or stalled, trying the next one"
-            rm -f "$OUT"
+            rm -f "$OUT" "$OUT.aria2"
           done
           [ "$ok" = "1" ] || { echo "::error::no mirror served ${SDK_TARBALL}"; exit 1; }
           ls -l "$OUT"
@@ -636,6 +647,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: openwrt-packages
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
           path: dist
       - name: Refuse to write a release without the full matrix
         # Belt and braces next to the gate job: the requirement is stated where
